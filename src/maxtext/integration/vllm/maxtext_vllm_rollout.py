@@ -370,7 +370,7 @@ def unroll_qwen_scanned_weights(weights, scan_axis: int = 1, pattern_length: Opt
 
   scan_length = scan_lengths.pop()
   scanned_key_paths = {key for key, _, _, _, _ in scanned_keys}
-  new_flat_w = {key: value for key, value in flat_w.items() if key not in scanned_key_paths}
+  new_flat_w = dict(flat_w)  # Keep scanned keys so scan_layers=True vLLM target matches all 28 layers!
 
   for key, value, container_idx, slot_idx, consumed in scanned_keys:
     prefix = key[:container_idx]

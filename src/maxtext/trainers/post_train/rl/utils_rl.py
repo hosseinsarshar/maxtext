@@ -664,7 +664,7 @@ def get_optimizer(tmvp_config: Any) -> optax.GradientTransformation:
   # inject_hyperparams so opt_state.hyperparams['learning_rate'] is at the
   # top level of the state tree. This is required for tunix's peft_trainer to
   # automatically read and log the per-step learning rate.
-  return optax.inject_hyperparams(make_optimizer)(learning_rate=schedule)
+  return optax.inject_hyperparams(make_optimizer, hyperparam_dtype=np.float32)(learning_rate=schedule)
 
 
 def format_maxtext_messages(

@@ -410,6 +410,11 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
   argv_list = ["", str(vllm_config_path), "log_config=False"]
   vllm_config = pyconfig.initialize(argv_list, config_class=types.RLConfig)
 
+  if os.environ.get("TPU_MESH_BASED_DP", "0").lower() in ("1", "true", "yes"):
+    import tpu_inference.core.mesh_dp_inproc as _mesh_dp_inproc
+    _mesh_dp_inproc.install()
+    max_logging.log("MESH-DP ARM: installed tpu_inference.core.mesh_dp_inproc.install() on HEAD c28166ca7!")
+
   rl_rollout_engine = functools.partial(MaxTextVllmRollout, maxtext_config=trainer_config)
 
   rollout_vllm_kwargs = {
@@ -792,6 +797,8 @@ def main(argv: Sequence[str], kwargs: dict = None) -> None:
   """
   kwargs = kwargs or {}
   pathwaysutils.initialize()
+  if pathwaysutils.is_pathways_backend_used():
+    pathwaysutils.profiling.monkey_patch_jax()
   os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
 
   max_utils.print_system_information()
