@@ -49,7 +49,7 @@ _POOL_NUM_PROCS = None
 _DEFAULT_MAX_PROCS = 8
 # Recycle a worker after this many tasks. Bounds sympy's internal cache
 # growth in long-lived workers without paying the cold-start cost too often.
-_MAX_TASKS_PER_CHILD = 100
+_MAX_TASKS_PER_CHILD = 100000
 # SIGTERM grace period before escalating to SIGKILL on stuck workers.
 _TERMINATE_GRACE_SECONDS = 2.0
 
@@ -76,6 +76,7 @@ def silent_worker_init() -> None:
   os.environ["TPU_STDERR_LOG_LEVEL"] = "3"
   os.environ["GRPC_VERBOSITY"] = "ERROR"
   try:
+    import logging as py_logging  # pylint: disable=import-outside-toplevel
     # Eagerly import the heavy grader stack so all subsequent
     # `verify_math_worker` calls in this worker are fast.
     import math_verify  # pylint: disable=import-outside-toplevel,unused-import
@@ -86,6 +87,8 @@ def silent_worker_init() -> None:
     )
     from sympy.parsing import sympy_parser  # pylint: disable=import-outside-toplevel,unused-import
     from sympy import Basic, MatrixBase  # pylint: disable=import-outside-toplevel,unused-import
+
+    py_logging.getLogger("math_verify").setLevel(py_logging.CRITICAL)
   except Exception:  # pylint: disable=broad-exception-caught
     # If the import fails, individual jobs will fail too and return 0.0;
     # don't crash the worker at startup.
@@ -251,7 +254,8 @@ def math_verify_pool(
         active_jobs.pop(i)
 
     # Small sleep to prevent high CPU usage during the loop
-    time.sleep(0.1)
+    if active_jobs:
+      time.sleep(0.005)
 
   if log_fn:
     log_fn(f"math_verify_pool: Processed {cnt}/{len(items)} items ({len(active_jobs)} timed out).")
