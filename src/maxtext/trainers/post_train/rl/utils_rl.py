@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import threading
 import uuid
 from typing import Any, Callable, Optional
 from etils import epath
@@ -163,6 +164,10 @@ def boxed(x: str) -> str:
   return "\\boxed{" + x + "}" if not x.startswith("\\boxed{") else x
 
 
+_MATCH_FORMAT_REGEX_CACHE: dict[tuple[str, str, str, str], re.Pattern[str]] = {}
+_ANSWER_FALLBACK_REGEX_CACHE: dict[tuple[str, str], re.Pattern[str]] = {}
+
+
 def get_match_format_regex(tmvp_config: Any) -> re.Pattern[str]:
   """Returns a compiled regex to extract the answer from a completion."""
   # Some thinking-model chat templates (Qwen3.5) prefill the opening
@@ -173,13 +178,23 @@ def get_match_format_regex(tmvp_config: Any) -> re.Pattern[str]:
       if getattr(tmvp_config, "reasoning_start_token_in_prompt", False)
       else re.escape(tmvp_config.reasoning_start_token)
   )
-  match_format = re.compile(
-      (
-          rf"{reasoning_start}.*?{re.escape(tmvp_config.reasoning_end_token)}.*?"
-          rf"{re.escape(tmvp_config.solution_start_token)}(.+?){re.escape(tmvp_config.solution_end_token)}"
-      ),
-      flags=re.MULTILINE | re.DOTALL,
+  cache_key = (
+      reasoning_start,
+      tmvp_config.reasoning_end_token,
+      tmvp_config.solution_start_token,
+      tmvp_config.solution_end_token,
   )
+  match_format = _MATCH_FORMAT_REGEX_CACHE.get(cache_key)
+  if match_format is None:
+    prefix = f"{reasoning_start}.*?" if reasoning_start else ""
+    match_format = re.compile(
+        (
+            rf"{prefix}{re.escape(tmvp_config.reasoning_end_token)}.*?"
+            rf"{re.escape(tmvp_config.solution_start_token)}(.+?){re.escape(tmvp_config.solution_end_token)}"
+        ),
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    _MATCH_FORMAT_REGEX_CACHE[cache_key] = match_format
   if tmvp_config.debug:
     match_format.search(
         f"{tmvp_config.reasoning_start_token}Let me"
@@ -195,10 +210,18 @@ def get_answer_fallback_regex(tmvp_config: Any) -> re.Pattern[str]:
   format is incomplete (e.g. missing the closing reasoning tag).  The result
   reward can still be computed independently from the format reward.
   """
-  return re.compile(
-      rf"{re.escape(tmvp_config.solution_start_token)}(.+?){re.escape(tmvp_config.solution_end_token)}",
-      flags=re.MULTILINE | re.DOTALL,
+  cache_key = (
+      tmvp_config.solution_start_token,
+      tmvp_config.solution_end_token,
   )
+  pattern = _ANSWER_FALLBACK_REGEX_CACHE.get(cache_key)
+  if pattern is None:
+    pattern = re.compile(
+        rf"{re.escape(tmvp_config.solution_start_token)}(.+?){re.escape(tmvp_config.solution_end_token)}",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    _ANSWER_FALLBACK_REGEX_CACHE[cache_key] = pattern
+  return pattern
 
 
 def match_format_exactly(prompts: list[str], completions: list[str], tmvp_config: Any, **kargs: Any) -> list[float]:
@@ -206,13 +229,26 @@ def match_format_exactly(prompts: list[str], completions: list[str], tmvp_config
   Give the model a reward of tmvp_config.reward_exact_format_match points if the format matches exactly.
   """
   scores = []
-  match_format = get_match_format_regex(tmvp_config)
-  for completion in completions:
+  start_in_prompt = getattr(tmvp_config, "reasoning_start_token_in_prompt", False)
+  start_tok = tmvp_config.reasoning_start_token
+  end_tok = tmvp_config.reasoning_end_token
+  sol_start = tmvp_config.solution_start_token
+  sol_end = tmvp_config.solution_end_token
+  reward = tmvp_config.reward_exact_format_match
+  for response in completions:
     score = 0
-    response = completion
-    # Match if format is seen exactly!
-    if match_format.search(response) is not None:
-      score += tmvp_config.reward_exact_format_match
+    # Ordered C-level str.find check is equivalent to the DOTALL regex
+    # `{start_tok}?.*?{end_tok}.*?{sol_start}(.+?){sol_end}` and runs in O(N)
+    # without regex backtracking on 25k-char unclosed completions.
+    p0 = 0 if start_in_prompt else response.find(start_tok)
+    if p0 >= 0:
+      p1 = response.find(end_tok, p0 if start_in_prompt else p0 + len(start_tok))
+      if p1 >= 0:
+        p2 = response.find(sol_start, p1 + len(end_tok))
+        if p2 >= 0:
+          p3 = response.find(sol_end, p2 + len(sol_start) + 1)
+          if p3 >= 0:
+            score += reward
     scores.append(score)
   return scores
 
@@ -254,6 +290,21 @@ def match_format_approximately(prompts: list[str], completions: list[str], tmvp_
   return scores
 
 
+_MIXED_NUMBER_REGEX = re.compile(r"([0-9]) +([0-9])")
+_UNITS_REGEX = re.compile(
+    r"(?:" + "|".join(sorted(UNITS, key=len, reverse=True)) + r")(?:es)?(?:s)? *(?:\^[0-9]+)?"
+)
+_LATEX_FRAC_EXTRACT_REGEX = re.compile(
+    r".*?(\d+)?\s*\$\s*(\d+)?\s*(\\frac\{.*?\}\{.*?\}|\d+/\d+)\s*\$.*"
+)
+_TEXT_BRACE_REGEX = re.compile(r"(\\text\{)(.*?)(\})")
+_TEXTBF_BRACE_REGEX = re.compile(r"(\\textbf\{)(.*?)(\})")
+_OVERLINE_BRACE_REGEX = re.compile(r"(\\overline\{)(.*?)(\})")
+_BOXED_BRACE_REGEX = re.compile(r"(\\boxed\{)(.*)(\})")
+_SHORTHAND_FRAC_REGEX = re.compile(r"(frac)([^{])(.)")
+_SHORTHAND_SQRT_REGEX = re.compile(r"(sqrt)([^{])")
+
+
 def normalize_final_answer(final_answer: str) -> str:
   """Normalize a final answer to a quantitative reasoning question.
 
@@ -267,26 +318,26 @@ def normalize_final_answer(final_answer: str) -> str:
 
   # Inject implicit mixed numbers BEFORE the substitutions strip spaces
   # (mirrors Tunix `_inject_implicit_mixed_number`): "7 3/4" -> "7+3/4".
-  final_answer = re.sub(r"([0-9]) +([0-9])", r"\1+\2", final_answer)
+  final_answer = _MIXED_NUMBER_REGEX.sub(r"\1+\2", final_answer)
 
   # Apply substitutions and removals
   for before, after in SUBSTITUTIONS:
     final_answer = final_answer.replace(before, after)
-  for unit in UNITS:
-    final_answer = re.sub(rf"{unit}(es)?(s)? *(\^[0-9]+)?", "", final_answer)
+  final_answer = _UNITS_REGEX.sub("", final_answer)
   for expr in REMOVED_EXPRESSIONS:
     final_answer = final_answer.replace(expr, "")
 
   # Extract and normalize LaTeX math
-  final_answer = re.sub(
-      r".*?(\d+)?\s*\$\s*(\d+)?\s*(\\frac\{.*?\}\{.*?\}|\d+/\d+)\s*\$.*",
-      lambda m: f"${w}{m.group(3)}$" if (w := (m.group(1) or m.group(2))) else f"${m.group(3)}$",
-      final_answer,
-  )
-  final_answer = re.sub(r"(\\text\{)(.*?)(\})", "\\2", final_answer)
-  final_answer = re.sub(r"(\\textbf\{)(.*?)(\})", "\\2", final_answer)
-  final_answer = re.sub(r"(\\overline\{)(.*?)(\})", "\\2", final_answer)
-  final_answer = re.sub(r"(\\boxed\{)(.*)(\})", "\\2", final_answer)
+  if "$" in final_answer:
+    final_answer = _LATEX_FRAC_EXTRACT_REGEX.sub(
+        lambda m: f"${w}{m.group(3)}$" if (w := (m.group(1) or m.group(2))) else f"${m.group(3)}$",
+        final_answer,
+    )
+  if "\\" in final_answer:
+    final_answer = _TEXT_BRACE_REGEX.sub("\\2", final_answer)
+    final_answer = _TEXTBF_BRACE_REGEX.sub("\\2", final_answer)
+    final_answer = _OVERLINE_BRACE_REGEX.sub("\\2", final_answer)
+    final_answer = _BOXED_BRACE_REGEX.sub("\\2", final_answer)
 
   # Normalize shorthand TeX:
   #  \fracab -> \frac{a}{b}
@@ -294,8 +345,10 @@ def normalize_final_answer(final_answer: str) -> str:
   #  \fracabc -> \frac{a}{b}c
   #  \sqrta -> \sqrt{a}
   #  \sqrtab -> sqrt{a}b
-  final_answer = re.sub(r"(frac)([^{])(.)", "frac{\\2}{\\3}", final_answer)
-  final_answer = re.sub(r"(sqrt)([^{])", "sqrt{\\2}", final_answer)
+  if "frac" in final_answer:
+    final_answer = _SHORTHAND_FRAC_REGEX.sub("frac{\\2}{\\3}", final_answer)
+  if "sqrt" in final_answer:
+    final_answer = _SHORTHAND_SQRT_REGEX.sub("sqrt{\\2}", final_answer)
   final_answer = final_answer.replace("$", "")
 
   # Leading-zero fixups (Tunix `_strip_string` lines 143-149). Spaces have
@@ -334,102 +387,114 @@ def preprocess_math_string(text: str) -> str:
   return text
 
 
+_ESCAPE_FIXES = (
+    ("\f", "rac", r"\frac"),  # \f (form feed) → \frac
+    ("\n", "ewline", r"\newline"),  # \n (newline) → \newline
+    ("\n", "e", r"\ne"),  # \n (newline) → \ne (not equal)
+    ("\t", "heta", r"\theta"),  # \t (tab) → \theta
+    ("\t", "an", r"\tan"),  # \t (tab) → \tan
+    ("\t", "o", r"\to"),  # \t (tab) → \to
+    ("\t", "imes", r"\times"),  # \t (tab) → \times
+    ("\t", "ext", r"\text"),  # \t (tab) → \text
+    ("\t", "extbf", r"\textbf"),  # \t (tab) → \textbf
+    ("\t", "extit", r"\textit"),  # \t (tab) → \textit  # codespell:ignore
+    ("\r", "ightarrow", r"\rightarrow"),  # \r (carriage return) → \rightarrow
+    ("\r", "ightarrow", r"\Rightarrow"),  # \r (carriage return) → \Rightarrow (capital R handled separately)
+    ("\b", "eta", r"\beta"),  # \b (backspace) → \beta
+    ("\b", "ar", r"\bar"),  # \b (backspace) → \bar
+    ("\b", "inom", r"\binom"),  # \b (backspace) → \binom
+    ("\b", "oxed", r"\boxed"),  # \b (backspace) → \boxed
+    ("\a", "lpha", r"\alpha"),  # \a (bell) → \alpha
+    ("\a", "pprox", r"\approx"),  # \a (bell) → \approx
+    ("\v", "ec", r"\vec"),  # \v (vertical tab) → \vec
+)
+
+_LATEX_COMMANDS = (
+    "frac",
+    "sqrt",
+    "pi",
+    "theta",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "sum",
+    "int",
+    "infty",
+    "cdot",
+    "times",
+    "div",
+    "pm",
+    "mp",
+    "leq",
+    "geq",
+    "neq",
+    "approx",
+    "equiv",
+    "sin",
+    "cos",
+    "tan",
+    "log",
+    "ln",
+    "exp",
+    "lim",
+    "to",
+    "rightarrow",
+    "leftarrow",
+    "Rightarrow",
+    "Leftarrow",
+    "overline",
+    "underline",
+    "hat",
+    "bar",
+    "vec",
+    "dot",
+    "ddot",
+    "mathbb",
+    "mathbf",
+    "mathrm",
+    "text",
+    "textbf",
+    "textit",
+    "boxed",
+    "left",
+    "right",
+    "choose",
+    "binom",
+)
+_LATEX_COMMANDS_REGEX = re.compile(
+    r"(?<!\\)\b(?:" + "|".join(_LATEX_COMMANDS) + r")\b"
+)
+
+
 def fix_latex_escaping(text: str) -> str:
   """Fix common LaTeX commands that lost their backslashes due to Python string escaping.
 
   This handles cases where someone writes "\frac" in a regular string and it becomes "frac".
   Also handles cases where escape sequences like \f, \n, \t, \r, \b, \a, \v were interpreted by Python.
   """
-  # First, try to recover from Python escape sequences that were interpreted
-  # Map of (escape_char, LaTeX_suffix) -> LaTeX_command
-  escape_fixes = [
-      ("\f", "rac", r"\frac"),  # \f (form feed) → \frac
-      ("\n", "ewline", r"\newline"),  # \n (newline) → \newline
-      ("\n", "e", r"\ne"),  # \n (newline) → \ne (not equal)
-      ("\t", "heta", r"\theta"),  # \t (tab) → \theta
-      ("\t", "an", r"\tan"),  # \t (tab) → \tan
-      ("\t", "o", r"\to"),  # \t (tab) → \to
-      ("\t", "imes", r"\times"),  # \t (tab) → \times
-      ("\t", "ext", r"\text"),  # \t (tab) → \text
-      ("\t", "extbf", r"\textbf"),  # \t (tab) → \textbf
-      ("\t", "extit", r"\textit"),  # \t (tab) → \textit  # codespell:ignore
-      ("\r", "ightarrow", r"\rightarrow"),  # \r (carriage return) → \rightarrow
-      ("\r", "ightarrow", r"\Rightarrow"),  # \r (carriage return) → \Rightarrow (capital R handled separately)
-      ("\b", "eta", r"\beta"),  # \b (backspace) → \beta
-      ("\b", "ar", r"\bar"),  # \b (backspace) → \bar
-      ("\b", "inom", r"\binom"),  # \b (backspace) → \binom
-      ("\b", "oxed", r"\boxed"),  # \b (backspace) → \boxed
-      ("\a", "lpha", r"\alpha"),  # \a (bell) → \alpha
-      ("\a", "pprox", r"\approx"),  # \a (bell) → \approx
-      ("\v", "ec", r"\vec"),  # \v (vertical tab) → \vec
-  ]
-
-  for escape_char, suffix, latex_cmd in escape_fixes:
+  for escape_char, suffix, latex_cmd in _ESCAPE_FIXES:
     if escape_char in text:
       text = text.replace(escape_char + suffix, latex_cmd)
 
-  # Common LaTeX commands that might have lost their backslashes
-  latex_commands = [
-      "frac",
-      "sqrt",
-      "pi",
-      "theta",
-      "alpha",
-      "beta",
-      "gamma",
-      "delta",
-      "sum",
-      "int",
-      "infty",
-      "cdot",
-      "times",
-      "div",
-      "pm",
-      "mp",
-      "leq",
-      "geq",
-      "neq",
-      "approx",
-      "equiv",
-      "sin",
-      "cos",
-      "tan",
-      "log",
-      "ln",
-      "exp",
-      "lim",
-      "to",
-      "rightarrow",
-      "leftarrow",
-      "Rightarrow",
-      "Leftarrow",
-      "overline",
-      "underline",
-      "hat",
-      "bar",
-      "vec",
-      "dot",
-      "ddot",
-      "mathbb",
-      "mathbf",
-      "mathrm",
-      "text",
-      "textbf",
-      "textit",
-      "boxed",
-      "left",
-      "right",
-      "choose",
-      "binom",
-  ]
+  # Single compiled regex pass instead of 52 separate uncompiled re.sub calls.
+  return _LATEX_COMMANDS_REGEX.sub(r"\\\g<0>", text)
 
-  # Add backslashes to commands that appear to be missing them
-  for cmd in latex_commands:
-    # Match the command if it appears as a word boundary (not already escaped)
-    # and not already preceded by a backslash
-    text = re.sub(rf"(?<!\\)\b{cmd}\b", rf"\\{cmd}", text)
 
-  return text
+_DEBUG_LOG_MKDIR_DONE: set[str] = set()
+
+
+def _write_debug_log_async(base_dir: str, run_name: str, log_content: str) -> None:
+  try:
+    debug_log_path = epath.Path(base_dir) / run_name / "debug_rl_logs"
+    key = f"{base_dir}/{run_name}"
+    if key not in _DEBUG_LOG_MKDIR_DONE:
+      debug_log_path.mkdir(parents=True, exist_ok=True)
+      _DEBUG_LOG_MKDIR_DONE.add(key)
+    log_file = debug_log_path / f"check_numbers_{uuid.uuid4().hex}.txt"
+    log_file.write_text(log_content)
+  except Exception:
+    pass
 
 
 def check_numbers(
@@ -443,7 +508,17 @@ def check_numbers(
 
   # Extract full answer content from solution tags (not just first number)
   extracted_responses = [extract_answer(c, tmvp_config) for c in completions]
-  true_answers = [list(dict.fromkeys(json.loads(acceptable_answers))) for acceptable_answers in answer]
+  parsed_answer_cache: dict[str, list[str]] = {}
+  true_answers: list[list[str]] = []
+  for acceptable_answers in answer:
+    uniq = parsed_answer_cache.get(acceptable_answers)
+    if uniq is None:
+      uniq = list(dict.fromkeys(json.loads(acceptable_answers)))
+      parsed_answer_cache[acceptable_answers] = uniq
+    true_answers.append(uniq)
+
+  norm_answer_cache: dict[str, str] = {}
+  norm_guess_cache: dict[str, list[str]] = {}
 
   scores = [tmvp_config.penalty_incorrect_format] * len(completions)  # Default to penalty for incorrect format
   math_verify_queue = []
@@ -456,31 +531,35 @@ def check_numbers(
       continue
 
     has_exact_match = False
+    guess_stripped = guess.strip()
     for true_answer in unique_answers:
       # 1. Check for exact or whitespace-normalized match first for a quick reward
       if guess == true_answer:
         scores[gen_idx] = max(scores[gen_idx], tmvp_config.reward_exact_answer)
         has_exact_match = True
-      elif guess.strip() == true_answer.strip():
+      elif guess_stripped == true_answer.strip():
         scores[gen_idx] = max(scores[gen_idx], tmvp_config.reward_white_space_format_match)
         has_exact_match = True
 
     if not has_exact_match:
-      norm_guess = preprocess_math_string(guess)
+      boxed_guess_list = norm_guess_cache.get(guess)
+      if boxed_guess_list is None:
+        boxed_guess_list = [boxed(preprocess_math_string(guess))]
+        norm_guess_cache[guess] = boxed_guess_list
       norm_answers = []
       for true_answer in unique_answers:
-        norm_answer = preprocess_math_string(true_answer)
-        norm_answers.append(boxed(norm_answer))
-      math_verify_queue.append((gen_idx, norm_answers, [boxed(norm_guess)]))
+        boxed_ans = norm_answer_cache.get(true_answer)
+        if boxed_ans is None:
+          boxed_ans = boxed(preprocess_math_string(true_answer))
+          norm_answer_cache[true_answer] = boxed_ans
+        norm_answers.append(boxed_ans)
+      math_verify_queue.append((gen_idx, norm_answers, boxed_guess_list))
 
   if math_verify_queue:
     # 2. Try math_verify for robust mathematical correctness checking
     scores = math_verify_func(math_verify_queue, scores, trainer_config=tmvp_config)
 
   if tmvp_config.debug:
-    debug_log_path = epath.Path(tmvp_config.base_output_directory) / tmvp_config.run_name / "debug_rl_logs"
-    debug_log_path.mkdir(parents=True, exist_ok=True)
-    log_file = debug_log_path / f"check_numbers_{uuid.uuid4().hex}.txt"
     log_content = (
         "START ============================\n"
         f"Question: {question[0]}\n"
@@ -490,7 +569,11 @@ def check_numbers(
         f"Reward Score: {scores[0]}\n"
         "END ==============================\n"
     )
-    log_file.write_text(log_content)
+    threading.Thread(
+        target=_write_debug_log_async,
+        args=(tmvp_config.base_output_directory, tmvp_config.run_name, log_content),
+        daemon=True,
+    ).start()
 
   return scores
 
@@ -499,6 +582,7 @@ _BOXED_PREFIX = "\\boxed"
 
 
 _BRACE_REGEX = re.compile(r"[{}]")
+_BOXED_FALLBACK_REGEX = re.compile(r"\\boxed\s*\{?\s*([a-zA-Z0-9\.,\-]+)\s*\}?")
 
 
 def _last_balanced_boxed(content: str) -> str | None:
@@ -513,6 +597,11 @@ def _last_balanced_boxed(content: str) -> str | None:
   unchanged: the box that closes last wins and boxes that never close are
   ignored.
   """
+  first_boxed = content.find(_BOXED_PREFIX)
+  if first_boxed < 0:
+    return None
+  if first_boxed > 0:
+    content = content[first_boxed:]
   best: str | None = None
   stack: list[int] = []
   for m in _BRACE_REGEX.finditer(content):
@@ -551,18 +640,23 @@ def extract_answer(response: str, tmvp_config: Any) -> str:
   and the plain-text fallback (step 3) reuse `get_answer_fallback_regex`,
   built from `tmvp_config.solution_start_token` / `solution_end_token`.
   """
-  answer_tag_regex = get_answer_fallback_regex(tmvp_config)
-  answer_matches = answer_tag_regex.findall(response)
+  sol_start = tmvp_config.solution_start_token
+  sol_end = tmvp_config.solution_end_token
+  if sol_start in response and sol_end in response:
+    answer_tag_regex = get_answer_fallback_regex(tmvp_config)
+    answer_matches = answer_tag_regex.findall(response)
+  else:
+    answer_matches = None
   content = answer_matches[-1] if answer_matches else response
-  boxed_answer = _last_balanced_boxed(content)
-  if boxed_answer is not None:
-    return boxed_answer
-  m = re.search(r"\\boxed\s*\{?\s*([a-zA-Z0-9\.,\-]+)\s*\}?", content)
-  if m:
-    return m.group(1).strip()
-  fallback_matches = answer_tag_regex.findall(response)
-  if fallback_matches:
-    return fallback_matches[-1].strip()
+  if _BOXED_PREFIX in content:
+    boxed_answer = _last_balanced_boxed(content)
+    if boxed_answer is not None:
+      return boxed_answer
+    m = _BOXED_FALLBACK_REGEX.search(content)
+    if m:
+      return m.group(1).strip()
+  if answer_matches:
+    return answer_matches[-1].strip()
   return FALLBACK_ANSWER
 
 

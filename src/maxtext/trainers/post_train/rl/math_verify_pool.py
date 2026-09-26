@@ -38,6 +38,7 @@ used during GRPO/GSPO training to compute rewards for each example in a batch.
 import atexit
 import itertools
 import multiprocessing
+import multiprocessing.pool
 import os
 import threading
 import time
@@ -46,7 +47,7 @@ from typing import Any, Callable, Optional
 # Module-level persistent pool state.
 _POOL = None
 _POOL_NUM_PROCS = None
-_DEFAULT_MAX_PROCS = 8
+_DEFAULT_MAX_PROCS = 16
 # Recycle a worker after this many tasks. Bounds sympy's internal cache
 # growth in long-lived workers without paying the cold-start cost too often.
 _MAX_TASKS_PER_CHILD = 100000
@@ -235,30 +236,49 @@ def math_verify_pool(
 
   cnt = 0
   pool = _get_pool(num_procs)
-  active_jobs = [(idx, pool.apply_async(verify_math_worker, (golds, predictions))) for (idx, golds, predictions) in items]
+  unique_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[list[int], list[str], list[str]]] = {}
+  for idx, golds, predictions in items:
+    key = (tuple(golds), tuple(predictions))
+    grp = unique_groups.get(key)
+    if grp is None:
+      unique_groups[key] = ([idx], golds, predictions)
+    else:
+      grp[0].append(idx)
+
+  active_jobs = [
+      (indices, pool.apply_async(verify_math_worker, (golds, predictions)))
+      for indices, golds, predictions in unique_groups.values()
+  ]
   start_time = time.time()
   while active_jobs and (time.time() - start_time < timeout):
     # Iterate backwards to safely remove items from the list without skipping elements
     for i in range(len(active_jobs) - 1, -1, -1):
-      idx, job = active_jobs[i]
+      indices, job = active_jobs[i]
       if job.ready():
         try:
           # .get(0) returns immediately since ready() was true
           score = job.get(0)
           if score > 0.0:
-            scores[idx] = max(scores[idx], trainer_config.reward_exact_answer)
-          cnt += 1
+            reward = trainer_config.reward_exact_answer
+            for idx in indices:
+              scores[idx] = max(scores[idx], reward)
+          cnt += len(indices)
         except Exception as e:  # pylint: disable=broad-exception-caught
           if log_fn:
-            log_fn(f"math_verify_pool failed ({e}) for idx: {idx}")
+            log_fn(f"math_verify_pool failed ({e}) for indices: {indices}")
         active_jobs.pop(i)
 
     # Small sleep to prevent high CPU usage during the loop
     if active_jobs:
-      time.sleep(0.005)
+      time.sleep(0.001)
 
+  timed_out_items = sum(len(indices) for indices, _ in active_jobs)
   if log_fn:
-    log_fn(f"math_verify_pool: Processed {cnt}/{len(items)} items ({len(active_jobs)} timed out).")
+    log_fn(
+        f"math_verify_pool: Processed {cnt}/{len(items)} items"
+        f" ({len(unique_groups)} unique, {timed_out_items} timed out)"
+        f" in {(time.time() - start_time)*1000:.1f}ms."
+    )
   if len(active_jobs) > 0:
     _shutdown_pool()
   return scores
