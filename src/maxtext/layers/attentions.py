@@ -1158,6 +1158,10 @@ class Attention(nnx.Module):
     # position. Only the donor writes the cache; shared layers read it as-is.
     update_kv_cache = not self.share_kv_layer
 
+    # tpu_inference marks the fused decode loop's metadata decode-only (one
+    # query token per row). The RPA op then skips its empty mixed pass.
+    extra_kwargs = {"decode_only": True} if getattr(md, "decode_only", False) else {}
+
     output, kv_cache = rpa_ops(
         self.mesh,
         query,
@@ -1175,6 +1179,7 @@ class Attention(nnx.Module):
         k_scale,
         v_scale,
         update_kv_cache=update_kv_cache,
+        **extra_kwargs,
     )
     return output, kv_cache
 
