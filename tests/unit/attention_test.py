@@ -3446,6 +3446,106 @@ class AttentionTest(parameterized.TestCase):
     self.assertTrue(jnp.allclose(output, expected_output))
     self.assertEqual(output.shape, (self.global_batch_size, seq_len, self.embed_dim))
 
+  def _make_gqa_serving_attention(self, dtype=jnp.float32, attention="vllm_rpa", model_mode=MODEL_MODE_AUTOREGRESSIVE, **kwargs):
+    """Builds a small Qwen3-style GQA layer (4 query heads per KV head, q/k norms) and its inputs."""
+    config = pyconfig.initialize(
+        [sys.argv[0], get_test_config_path()],
+        **{**self.config_arguments, "attention": attention},
+    )
+    head_dim = 16
+    inputs_shape = (self.global_batch_size, 4, 64)
+    layer = Attention(
+        config=config,
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        max_target_length=self.max_target_length,
+        max_prefill_predict_length=self.max_prefill_predict_length,
+        inputs_q_shape=inputs_shape,
+        inputs_kv_shape=inputs_shape,
+        mesh=self.mesh,
+        attention_kernel="dot_product",
+        dtype=dtype,
+        weight_dtype=dtype,
+        model_mode=model_mode,
+        use_qk_norm=True,
+        query_pre_attn_scalar=head_dim**-0.5,
+        rngs=nnx.Rngs(params=0, dropout=1),
+        **kwargs,
+    )
+    lnx = jax.random.normal(jax.random.PRNGKey(1), inputs_shape, dtype=dtype)
+    positions = jnp.broadcast_to(jnp.arange(inputs_shape[1], dtype=jnp.int32) + 5, inputs_shape[:2])
+    return layer, lnx, positions
+
+  def test_can_merge_vllm_qkv_needs_opt_in_and_plain_self_attention(self):
+    layer, lnx, _ = self._make_gqa_serving_attention()
+    with mock.patch.dict(os.environ, {"MAXTEXT_VLLM_MERGE_QKV": "0"}):
+      self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+    with mock.patch.dict(os.environ, {"MAXTEXT_VLLM_MERGE_QKV": "1"}):
+      self.assertTrue(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+      self.assertTrue(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_PREFILL, use_shared_kv=False))
+      # Cross-attention inputs, training, and donor K/V all keep separate projections.
+      self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx + 0, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+      self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_TRAIN, use_shared_kv=False))
+      self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=True))
+
+      not_vllm, lnx2, _ = self._make_gqa_serving_attention(attention="dot_product", model_mode=MODEL_MODE_TRAIN)
+      self.assertFalse(not_vllm.can_merge_vllm_qkv(lnx2, lnx2, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+      biased, lnx3, _ = self._make_gqa_serving_attention(use_bias_in_projections=True)
+      self.assertFalse(biased.can_merge_vllm_qkv(lnx3, lnx3, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+      # q, k and v sharded differently, or more head shards than KV heads.
+      for shards in (None, 4):
+        with mock.patch.object(Attention, "_qkv_head_shards", return_value=shards):
+          self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+
+  @parameterized.named_parameters(("one_head_shard", 1), ("two_head_shards", 2))
+  def test_merged_qkv_projection_matches_separate_projections(self, shards):
+    layer, lnx, _ = self._make_gqa_serving_attention()
+    with mock.patch.object(Attention, "_qkv_head_shards", return_value=shards):
+      query, key, value = layer.merged_qkv_projection(lnx)
+    np.testing.assert_allclose(query, layer.query_projection(lnx), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(key, layer.kv_projection(lnx, proj_name="key"), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(value, layer.kv_projection(lnx, proj_name="value"), rtol=1e-5, atol=1e-5)
+
+  @parameterized.named_parameters(
+      ("float32", jnp.float32, 1e-5),
+      ("bfloat16", jnp.bfloat16, 3e-2),
+  )
+  def test_vllm_call_with_merged_qkv_matches_separate_projections(self, dtype, tol):
+    """Runs the vLLM serving path with and without the merge; the RPA op is faked."""
+    layer, lnx, positions = self._make_gqa_serving_attention(dtype=dtype)
+    rpa_inputs = []
+
+    def fake_rpa(mesh, query, key, value, kv_cache, *args, **kwargs):
+      del mesh, args, kwargs
+      rpa_inputs.append((query, key, value))
+      return query, kv_cache
+
+    interface = types.ModuleType("tpu_inference.layers.common.attention_interface")
+    interface.sharded_ragged_paged_attention = fake_rpa
+    fake_modules = {name: types.ModuleType(name) for name in ("tpu_inference", "tpu_inference.layers", "tpu_inference.layers.common")}
+    fake_modules[interface.__name__] = interface
+
+    outputs = []
+    for flag in ("0", "1"):
+      with mock.patch.dict(sys.modules, fake_modules), mock.patch.dict(os.environ, {"MAXTEXT_VLLM_MERGE_QKV": flag}):
+        out, _ = layer(
+            lnx,
+            lnx,
+            inputs_positions=positions,
+            deterministic=True,
+            model_mode=MODEL_MODE_AUTOREGRESSIVE,
+            kv_cache=[jnp.zeros((1,))],
+            attention_metadata=mock.Mock(decode_only=False),
+        )
+      outputs.append(out)
+
+    self.assertLen(rpa_inputs, 2)
+    for separate, merged in zip(*rpa_inputs):
+      self.assertEqual(merged.shape, separate.shape)
+      np.testing.assert_allclose(np.asarray(merged, np.float32), np.asarray(separate, np.float32), rtol=tol, atol=tol)
+    np.testing.assert_allclose(np.asarray(outputs[1], np.float32), np.asarray(outputs[0], np.float32), rtol=tol, atol=tol)
+
 
 class MLATest(attention_test_util.MLATestBase):
   """Test for the Multi-Headed Latent Attention"""
