@@ -392,6 +392,11 @@ def create_rl_components(  # pylint: disable=too-many-positional-arguments
         skip_first_n_steps=trainer_config.skip_first_n_steps_for_profiler,
         profiler_steps=trainer_config.profiler_steps,
         set_profile_options=False,
+        max_num_hosts=(
+            len(jax.devices())
+            if trainer_config.upload_all_profiler_results
+            else None
+        ),
     )
 
   # Parse vllm_additional_config

@@ -88,10 +88,12 @@ rl:
 weight_dtype: 'bfloat16'
 attention: 'dot_product'
 remat_policy: 'custom'
-decoder_layer_input: 'offload'
-query_proj: 'offload'
-key_proj: 'offload'
-value_proj: 'offload'
+decoder_layer_input: 'device'
+query_proj: 'device'
+key_proj: 'device'
+value_proj: 'device'
+context: 'device'
+sa_use_fused_bwd_kernel: true
 use_pathways: true
 log_period: 20
 
