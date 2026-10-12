@@ -50,6 +50,8 @@ from maxtext.common.common_types import (
     MODEL_MODE_TRAIN,
     MODEL_MODE_PREFILL,
     AttentionType,
+    ShardMode,
+    is_fp8_dtype,
 )
 from maxtext.layers import nnx_wrappers
 from maxtext.layers.attention_op import AttentionOp, _resolve_attention_type
@@ -69,6 +71,7 @@ from maxtext.layers.normalizations import RMSNorm, Qwen3NextRMSNorm, GlobalRMSNo
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.inference import kvcache
 from maxtext.inference.kvcache import KVQuant
+from maxtext.utils import max_logging
 from maxtext.utils.sharding import maybe_shard_with_logical, create_sharding, logical_to_mesh_axes
 
 # pylint: disable=line-too-long, g-doc-args, g-doc-return-or-yield, bad-continuation, g-inconsistent-quotes
@@ -89,6 +92,30 @@ class L2Norm(nnx.Module):
 
   def __call__(self, x):
     return x * jax.lax.rsqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
+
+
+def _vllm_merge_qkv_requested() -> bool:
+  """Whether MAXTEXT_VLLM_MERGE_QKV asks vLLM serving to merge the q/k/v matmuls."""
+  return os.environ.get("MAXTEXT_VLLM_MERGE_QKV", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dense_kernel_in_compute_dtype(dense: DenseGeneral) -> Array:
+  """Reads a DenseGeneral kernel and casts it to the compute dtype, as DenseGeneral.__call__ does."""
+  kernel = dense.kernel
+  if hasattr(kernel, "get_value"):
+    kernel = kernel.get_value()
+  elif isinstance(kernel, (dict, nnx.State)) and "value" in kernel:
+    kernel = kernel["value"]
+  else:
+    kernel = getattr(kernel, "value", kernel)
+  if hasattr(kernel, "value"):
+    kernel = kernel.value
+  return jnp.asarray(kernel, dense.dtype)
+
+
+@functools.lru_cache(maxsize=None)
+def _log_merged_qkv_once(shards: int) -> None:
+  max_logging.log(f"attentions.py: vLLM serving merges the q/k/v matmuls into one ({shards} head shards).")
 
 
 def attention_as_linen(
@@ -797,6 +824,119 @@ class Attention(nnx.Module):
 
     return split_qkv(qkv_proj)
 
+  def can_merge_vllm_qkv(self, inputs_q: Array, inputs_kv: Array, model_mode: str, use_shared_kv: bool) -> bool:
+    """Whether vLLM serving can run the q, k and v projections as one matmul.
+
+    Opt-in through MAXTEXT_VLLM_MERGE_QKV=1. The merged matmul computes the same
+    dot products, but XLA may accumulate them in a different order, so results
+    can differ at the bf16 rounding level. Only plain self-attention
+    projections qualify: no quantization, fp8 weights, biases, shared or fused
+    projections, or explicit sharding; and q, k and v must shard the same way,
+    with the head shard count dividing num_kv_heads.
+
+    Call this before resharding the inputs: it relies on the caller passing the
+    same array for `inputs_q` and `inputs_kv`.
+    """
+    if not _vllm_merge_qkv_requested():
+      return False
+    if self.config.attention not in ("vllm_rpa", "vllm_batched_rpa") or model_mode == MODEL_MODE_TRAIN:
+      return False
+    if inputs_q is not inputs_kv or use_shared_kv:
+      return False
+    if (
+        self.config.fused_qkv
+        or self.share_kv_layer
+        or self.share_kv_projections
+        or self.is_qwen3_hybrid
+        or self.config.shard_mode == ShardMode.EXPLICIT
+        or self.num_query_heads % self.num_kv_heads
+    ):
+      return False
+    expected_out_features = {
+        "query": (self.num_query_heads, self.head_dim),
+        "key": (self.num_kv_heads, self.head_dim),
+        "value": (self.num_kv_heads, self.head_dim),
+    }
+    for name, out_features in expected_out_features.items():
+      proj = getattr(self, name, None)
+      if (
+          not isinstance(proj, DenseGeneral)
+          or proj.quant is not None
+          or proj.kernel_scale is not None
+          or is_fp8_dtype(proj.weight_dtype)
+          or proj.use_bias
+          or proj.parameter_memory_host_offload
+          or proj.use_two_stage_all_gather
+          or tuple(proj.axis) != (-1,)
+          or tuple(proj.out_features_shape) != out_features
+          or len(proj.kernel_axes) != 3
+      ):
+        return False
+    shards = self._qkv_head_shards()
+    return shards is not None and self.num_kv_heads % shards == 0
+
+  def _qkv_head_shards(self) -> int | None:
+    """Returns how many shards split the q/k/v heads, or None if q, k and v shard differently."""
+    specs = set()
+    for proj in (self.query, self.key, self.value):
+      spec = []
+      for axes in self._logical_to_mesh_axes(proj.kernel_axes):
+        if axes is None:
+          axes = ()
+        elif isinstance(axes, str):
+          axes = (axes,)
+        spec.append(tuple(axes))
+      specs.add(tuple(spec))
+    if len(specs) != 1:
+      return None
+    (spec,) = specs
+    shards = 1
+    for axis in spec[1]:
+      shards *= self.mesh.shape.get(axis, 1)
+    return shards
+
+  def merged_qkv_projection(self, inputs: Array) -> tuple[Array, Array, Array]:
+    """Runs the query, key and value projections as one matmul.
+
+    With P head shards, the merged kernel is (embed, P, (num_query_heads +
+    2 * num_kv_heads) / P, head_dim): block p holds shard p's query heads, then
+    its key heads, then its value heads. Heads are sharded in contiguous
+    blocks, so each block comes from its own shard of q, k and v, and the
+    concat needs no communication. The weights do not change while decoding,
+    so XLA hoists the concat out of the decode loop.
+
+    Why not group each KV head with its query heads, (embed, num_kv_heads,
+    G + 2, head_dim)? On TPU7x that layout lowered to a slower 2D-window
+    convolution and made the step slower than three separate matmuls.
+    """
+    shards = self._qkv_head_shards()
+    _log_merged_qkv_once(shards)
+    q_local = self.num_query_heads // shards
+    kv_local = self.num_kv_heads // shards
+    head_dim = self.head_dim
+    wq, wk, wv = (_dense_kernel_in_compute_dtype(proj) for proj in (self.query, self.key, self.value))
+    embed = wq.shape[0]
+    kernel = jnp.concatenate(
+        [
+            wq.reshape(embed, shards, q_local, head_dim),
+            wk.reshape(embed, shards, kv_local, head_dim),
+            wv.reshape(embed, shards, kv_local, head_dim),
+        ],
+        axis=2,
+    )
+    inputs = jnp.asarray(inputs, self.query.dtype)
+    qkv = jax.lax.dot_general(
+        inputs,
+        kernel,
+        (((inputs.ndim - 1,), (0,)), ((), ())),
+        precision=jax.lax.Precision(self.query.matmul_precision),
+    )
+    lead = qkv.shape[:-3]
+    query = qkv[..., :q_local, :].reshape(*lead, self.num_query_heads, head_dim)
+    key = qkv[..., q_local : q_local + kv_local, :].reshape(*lead, self.num_kv_heads, head_dim)
+    value = qkv[..., q_local + kv_local :, :].reshape(*lead, self.num_kv_heads, head_dim)
+    return query, key, value
+
   @property
   def out_head_dim(self) -> int:
     return self.head_dim
@@ -1235,6 +1375,10 @@ class Attention(nnx.Module):
     else:
       input_axis_names = self.decode_input_axis_names
 
+    # Decide before resharding: resharding gives inputs_q and inputs_kv separate tracers.
+    merge_qkv = self.can_merge_vllm_qkv(
+        inputs_q, inputs_kv, model_mode, use_shared_kv=shared_key is not None and shared_value is not None
+    )
     inputs_q = self._maybe_shard_with_logical(inputs_q, input_axis_names)
     inputs_kv = self._maybe_shard_with_logical(inputs_kv, input_axis_names)
     qkv_sharding = create_sharding(self.mesh, input_axis_names)
@@ -1248,6 +1392,8 @@ class Attention(nnx.Module):
     # apply projection.
     if self.config.fused_qkv:
       query, key, value = self.qkv_projection(inputs_q, proj_name="qkv_proj")
+    elif merge_qkv:
+      query, key, value = self.merged_qkv_projection(inputs_q)
     elif use_shared_kv:
       # Donor layer already produced rotated, normed K/V — use them directly.
       query = self.query_projection(inputs_q, out_sharding=qkv_sharding)
