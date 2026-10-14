@@ -14,10 +14,16 @@
 
 """Unit tests for RL result parsing and reward scoring (CPU-only)."""
 
+import os
+import pathlib
+import re
+import tempfile
 import unittest
+from unittest import mock
 import pytest
 from types import SimpleNamespace
 
+from maxtext.trainers.post_train.rl import math_verify_pool
 from maxtext.trainers.post_train.rl import utils_rl
 
 pytestmark = [pytest.mark.post_training]
@@ -279,6 +285,117 @@ class TestCheckNumbers(unittest.TestCase):
         answer=['["red"]'],
     )
     self.assertEqual(scores[0], self.config.penalty_incorrect_format)
+
+  def test_duplicate_guesses_are_graded_once(self):
+    """Completions with the same answer send one job to the math_verify pool and all get its score."""
+    submitted = []
+
+    class _InProcessPool:
+
+      def apply_async(self, fn, args):
+        submitted.append(args)
+        value = fn(*args)
+        return SimpleNamespace(ready=lambda: True, get=lambda timeout=None: value)
+
+    completions = ["<reasoning>r</reasoning><answer>\\frac{1}{2}</answer>"] * 3 + [
+        "<reasoning>r</reasoning><answer>0.25</answer>"
+    ]
+    with mock.patch.object(math_verify_pool, "_get_pool", return_value=_InProcessPool()):
+      scores = self._check(completions=completions, answer=['["0.5"]'] * 4)
+    self.assertEqual(len(submitted), 2)
+    self.assertEqual(scores, [self.config.reward_exact_answer] * 3 + [self.config.penalty_incorrect_format])
+
+  def test_debug_log_is_written_off_thread_and_failures_are_logged(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      utils_rl._write_debug_log_async(tmp, "run", "log text")  # pylint: disable=protected-access
+      files = list((pathlib.Path(tmp) / "run" / "debug_rl_logs").glob("check_numbers_*.txt"))
+      self.assertEqual([f.read_text(encoding="utf-8") for f in files], ["log text"])
+
+      not_a_dir = os.path.join(tmp, "file")
+      pathlib.Path(not_a_dir).write_text("", encoding="utf-8")
+      with mock.patch.object(utils_rl.max_logging, "log") as log:
+        utils_rl._write_debug_log_async(not_a_dir, "run", "log text")  # pylint: disable=protected-access
+      log.assert_called_once()
+
+
+class TestRewardFastPathsKeepSemantics(unittest.TestCase):
+  """The faster reward helpers must return what the code they replaced returned."""
+
+  def test_match_format_exactly_matches_the_format_regex(self):
+    config = _make_config()
+    completions = [
+        "",
+        "<reasoning>a</reasoning><answer>4</answer>",
+        "<reasoning>a</reasoning><answer></answer>",
+        "<answer>4</answer><reasoning>a</reasoning>",
+        "<reasoning>a</reasoning>x<answer>4",
+        "</reasoning><answer>4</answer>",
+        "<reasoning></reasoning>\n<answer>4</answer><answer>",
+        "<reasoning>" + "x" * 500 + "</reasoning>" + "<answer>" * 20,
+    ]
+    for start_in_prompt in (False, True):
+      config.reasoning_start_token_in_prompt = start_in_prompt
+      start = "" if start_in_prompt else re.escape(config.reasoning_start_token)
+      reference = re.compile(
+          rf"{start}.*?{re.escape(config.reasoning_end_token)}.*?"
+          rf"{re.escape(config.solution_start_token)}(.+?){re.escape(config.solution_end_token)}",
+          flags=re.MULTILINE | re.DOTALL,
+      )
+      expected = [bool(reference.search(c)) for c in completions]
+      with self.subTest(start_in_prompt=start_in_prompt):
+        scores = utils_rl.match_format_exactly(None, completions, config)
+        self.assertEqual(scores, [config.reward_exact_format_match if e else 0 for e in expected])
+        match_format = utils_rl.get_match_format_regex(config)  # Also used by evaluate_rl.
+        self.assertEqual([bool(match_format.search(c)) for c in completions], expected)
+
+  def test_units_are_removed_one_unit_at_a_time(self):
+    # Removing a unit can join its neighbors into another unit, so UNITS order
+    # matters. Expected values come from the original per-unit loop.
+    cases = {
+        "mmeterm": "",
+        "12cmonth": "12c",
+        "inchesecond": "e",
+        "degreemetersecond": "",
+        "5 square meters": "5",
+        "10 cm^2": "10",
+        "7 3/4 inches": "7+3/4",
+    }
+    for text, expected in cases.items():
+      self.assertEqual(utils_rl.normalize_final_answer(text), expected, text)
+
+  def test_fix_latex_escaping(self):
+    cases = {
+        "textbf{x} + text": "\\textbf{x} + \\text",
+        "x to infinity": "x \\to infinity",
+        "leftarrow": "\\leftarrow",
+        "pi r^2": "\\pi r^2",
+        "sqrt2 \\pi": "sqrt2 \\pi",
+        "tan theta": "\\tan \\theta",
+        "hat{x}": "\\hat{x}",
+        "photo": "photo",
+        "\tan x": "\\tan x",  # "\t" became a tab.
+        "\x08oxed{2}": "\\boxed{2}",  # "\b" became a backspace.
+    }
+    for text, expected in cases.items():
+      self.assertEqual(utils_rl.fix_latex_escaping(text), expected, repr(text))
+
+  def test_extract_answer_edge_cases(self):
+    config = _make_config()
+    cases = {
+        "": utils_rl.FALLBACK_ANSWER,
+        "no answer here": utils_rl.FALLBACK_ANSWER,
+        "<reasoning>r</reasoning><answer> 42 </answer>": "42",
+        "<answer>1</answer> then <answer>\\boxed{2}</answer>": "2",
+        "{{ \\boxed{5}": "5",  # Unmatched braces before the box.
+        "}} x \\boxed{6} {": "6",
+        "\\boxed{\\frac{1}{2}}": "\\frac{1}{2}",
+        "\\boxed{7": "7",  # Unclosed box: permissive fallback regex.
+        "<answer>\\boxed{3}": "3",  # No closing tag: search the whole response.
+        "\\boxed{1} and \\boxed{2}": "2",
+        "<answer>x</answer> \\boxed{9}": "x",  # The last answer block wins over a box outside it.
+    }
+    for response, expected in cases.items():
+      self.assertEqual(utils_rl.extract_answer(response, config), expected, response)
 
 
 class TestExtractHashAnswer(unittest.TestCase):

@@ -13,6 +13,10 @@
 # limitations under the License.
 
 """Tests for math_verify_pool grading and score-assignment logic."""
+import logging
+import os
+import subprocess
+import sys
 import pytest
 import unittest
 from types import SimpleNamespace
@@ -177,6 +181,99 @@ class MathVerifyPoolScoreAssignmentTest(unittest.TestCase):
     scores = [0.1, 0.2, 0.3]
     result = math_verify_pool(_make_config(1.0), [], scores)
     self.assertEqual(result, [0.1, 0.2, 0.3])
+
+
+class _CountingPool(_FakePool):
+  """`_FakePool` that records each submitted job's arguments."""
+
+  def __init__(self):
+    self.submitted = []
+
+  def apply_async(self, fn, args):
+    self.submitted.append(args)
+    return super().apply_async(fn, args)
+
+
+class _NeverReadyResult:
+
+  def ready(self):
+    return False
+
+
+class _FailedResult:
+
+  def ready(self):
+    return True
+
+  def get(self, timeout=None):  # pylint: disable=unused-argument
+    raise RuntimeError("worker died")
+
+
+class MathVerifyPoolDedupTest(unittest.TestCase):
+  """Items with the same golds and predictions are graded once; each index gets the score."""
+
+  def test_duplicate_items_are_graded_once(self):
+    pool = _CountingPool()
+    items = [
+        (0, ["\\boxed{42}"], ["\\boxed{42}"]),
+        (1, ["\\boxed{42}"], ["\\boxed{99}"]),
+        (2, ["\\boxed{42}"], ["\\boxed{42}"]),
+        (3, ["\\boxed{42}"], ["\\boxed{42}"]),
+    ]
+    logs = []
+    with patch.object(mvp, "_get_pool", return_value=pool):
+      result = math_verify_pool(_make_config(1.0), items, [0.0, -0.5, 0.5, 2.0], log_fn=logs.append)
+    self.assertEqual(pool.submitted, [(["\\boxed{42}"], ["\\boxed{42}"]), (["\\boxed{42}"], ["\\boxed{99}"])])
+    self.assertEqual(result, [1.0, -0.5, 1.0, 2.0])
+    self.assertIn("Processed 4/4 items (2 unique, 0 timed out)", logs[-1])
+
+  def test_timed_out_group_keeps_default_scores_and_resets_pool(self):
+    pool = _FakePool()
+    pool.apply_async = lambda fn, args: _NeverReadyResult()
+    items = [(0, ["a"], ["b"]), (1, ["a"], ["b"]), (2, ["a"], ["b"])]
+    logs = []
+    with patch.object(mvp, "_get_pool", return_value=pool), patch.object(mvp, "_shutdown_pool") as shutdown:
+      result = math_verify_pool(_make_config(1.0), items, [-0.5, -0.5, 0.0], timeout=0.05, log_fn=logs.append)
+    self.assertEqual(result, [-0.5, -0.5, 0.0])
+    shutdown.assert_called_once()
+    self.assertIn("Processed 0/3 items (1 unique, 3 timed out)", logs[-1])
+
+  def test_failed_job_keeps_default_scores_for_every_duplicate(self):
+    pool = _FakePool()
+    pool.apply_async = lambda fn, args: _FailedResult()
+    items = [(0, ["a"], ["b"]), (2, ["a"], ["b"])]
+    logs = []
+    with patch.object(mvp, "_get_pool", return_value=pool):
+      result = math_verify_pool(_make_config(1.0), items, [-0.5, 7.0, 0.25], log_fn=logs.append)
+    self.assertEqual(result, [-0.5, 7.0, 0.25])
+    self.assertIn("failed (worker died) for indices: [0, 2]", logs[0])
+
+
+class MathVerifyPoolModuleTest(unittest.TestCase):
+  """Module-level behavior: import and worker setup."""
+
+  def test_imports_in_a_fresh_interpreter(self):
+    # `_get_pool` is annotated with `multiprocessing.pool.Pool`, which needs an
+    # explicit `import multiprocessing.pool`. Load the file in a new process so
+    # no earlier import can hide a missing one.
+    code = (
+        "import importlib.util, sys\n"
+        "assert 'multiprocessing.pool' not in sys.modules\n"
+        f"spec = importlib.util.spec_from_file_location('mvp_fresh', {mvp.__file__!r})\n"
+        "spec.loader.exec_module(importlib.util.module_from_spec(spec))\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False, timeout=120)
+    self.assertEqual(proc.returncode, 0, proc.stderr)
+
+  def test_worker_init_silences_math_verify_logger(self):
+    logger = logging.getLogger("math_verify")
+    old_level = logger.level
+    try:
+      with patch.dict(os.environ):
+        mvp.silent_worker_init()
+      self.assertEqual(logger.level, logging.CRITICAL)
+    finally:
+      logger.setLevel(old_level)
 
 
 if __name__ == "__main__":
