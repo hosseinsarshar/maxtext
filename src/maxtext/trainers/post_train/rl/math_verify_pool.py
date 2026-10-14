@@ -37,7 +37,10 @@ used during GRPO/GSPO training to compute rewards for each example in a batch.
 
 import atexit
 import itertools
+import logging
 import multiprocessing
+# `_get_pool`'s return annotation needs the submodule; `import multiprocessing`
+# alone does not load it.
 import multiprocessing.pool
 import os
 import threading
@@ -47,9 +50,14 @@ from typing import Any, Callable, Optional
 # Module-level persistent pool state.
 _POOL = None
 _POOL_NUM_PROCS = None
+# Worker count when `math_verify_num_procs` is unset (capped at cpu_count()).
+# Each worker is a spawned interpreter with math_verify and sympy loaded.
 _DEFAULT_MAX_PROCS = 16
 # Recycle a worker after this many tasks. Bounds sympy's internal cache
-# growth in long-lived workers without paying the cold-start cost too often.
+# growth in long-lived workers. A recycled worker is respawned and re-imports
+# math_verify and sympy, which takes seconds of CPU. An RL step can grade up to
+# one task per completion (2,048 in a 256 x 8 GRPO batch), so a limit of 100
+# recycled workers every step; 100,000 recycles them every few hundred steps.
 _MAX_TASKS_PER_CHILD = 100000
 # SIGTERM grace period before escalating to SIGKILL on stuck workers.
 _TERMINATE_GRACE_SECONDS = 2.0
@@ -77,7 +85,6 @@ def silent_worker_init() -> None:
   os.environ["TPU_STDERR_LOG_LEVEL"] = "3"
   os.environ["GRPC_VERBOSITY"] = "ERROR"
   try:
-    import logging as py_logging  # pylint: disable=import-outside-toplevel
     # Eagerly import the heavy grader stack so all subsequent
     # `verify_math_worker` calls in this worker are fast.
     import math_verify  # pylint: disable=import-outside-toplevel,unused-import
@@ -89,7 +96,9 @@ def silent_worker_init() -> None:
     from sympy.parsing import sympy_parser  # pylint: disable=import-outside-toplevel,unused-import
     from sympy import Basic, MatrixBase  # pylint: disable=import-outside-toplevel,unused-import
 
-    py_logging.getLogger("math_verify").setLevel(py_logging.CRITICAL)
+    # math_verify logs its parse and verify failures. From many workers, that
+    # floods the trainer's stderr. Scores do not depend on it.
+    logging.getLogger("math_verify").setLevel(logging.CRITICAL)
   except Exception:  # pylint: disable=broad-exception-caught
     # If the import fails, individual jobs will fail too and return 0.0;
     # don't crash the worker at startup.
@@ -224,6 +233,8 @@ def math_verify_pool(
 
   Uses a persistent module-level pool. The first call pays the spawn +
   math_verify-import cost; subsequent calls reuse warm workers and grade.
+  Items with the same golds and predictions are graded once, and the score is
+  applied to each of their indices.
   """
   if not items:
     return scores
@@ -236,6 +247,9 @@ def math_verify_pool(
 
   cnt = 0
   pool = _get_pool(num_procs)
+  # GRPO samples several completions per prompt, and many give the same
+  # answer. `verify_math_worker` depends only on its inputs, so grading each
+  # distinct (golds, predictions) pair once gives the same scores.
   unique_groups: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[list[int], list[str], list[str]]] = {}
   for idx, golds, predictions in items:
     key = (tuple(golds), tuple(predictions))
@@ -258,17 +272,18 @@ def math_verify_pool(
         try:
           # .get(0) returns immediately since ready() was true
           score = job.get(0)
-          if score > 0.0:
-            reward = trainer_config.reward_exact_answer
-            for idx in indices:
-              scores[idx] = max(scores[idx], reward)
           cnt += len(indices)
         except Exception as e:  # pylint: disable=broad-exception-caught
+          score = 0.0  # Keep the default scores.
           if log_fn:
             log_fn(f"math_verify_pool failed ({e}) for indices: {indices}")
+        if score > 0.0:
+          for idx in indices:
+            scores[idx] = max(scores[idx], trainer_config.reward_exact_answer)
         active_jobs.pop(i)
 
-    # Small sleep to prevent high CPU usage during the loop
+    # Short sleep keeps the loop cheap without adding up to 0.1 s of latency
+    # after the last job finishes.
     if active_jobs:
       time.sleep(0.001)
 

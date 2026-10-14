@@ -186,6 +186,8 @@ def get_match_format_regex(tmvp_config: Any) -> re.Pattern[str]:
   )
   match_format = _MATCH_FORMAT_REGEX_CACHE.get(cache_key)
   if match_format is None:
+    # Without a start token, a leading `.*?` would not change whether `search`
+    # matches (or group 1), but it makes failed searches quadratic in length.
     prefix = f"{reasoning_start}.*?" if reasoning_start else ""
     match_format = re.compile(
         (
@@ -237,9 +239,11 @@ def match_format_exactly(prompts: list[str], completions: list[str], tmvp_config
   reward = tmvp_config.reward_exact_format_match
   for response in completions:
     score = 0
-    # Ordered C-level str.find check is equivalent to the DOTALL regex
-    # `{start_tok}?.*?{end_tok}.*?{sol_start}(.+?){sol_end}` and runs in O(N)
-    # without regex backtracking on 25k-char unclosed completions.
+    # Same result as `get_match_format_regex(tmvp_config).search(response)`:
+    # the tokens must appear in order, with at least one character between
+    # the solution tokens. Taking the first match of each token is enough, and
+    # str.find is linear, while the lazy regex backtracks on long completions
+    # that never close a tag.
     p0 = 0 if start_in_prompt else response.find(start_tok)
     if p0 >= 0:
       p1 = response.find(end_tok, p0 if start_in_prompt else p0 + len(start_tok))
@@ -291,12 +295,11 @@ def match_format_approximately(prompts: list[str], completions: list[str], tmvp_
 
 
 _MIXED_NUMBER_REGEX = re.compile(r"([0-9]) +([0-9])")
-_UNITS_REGEX = re.compile(
-    r"(?:" + "|".join(sorted(UNITS, key=len, reverse=True)) + r")(?:es)?(?:s)? *(?:\^[0-9]+)?"
-)
-_LATEX_FRAC_EXTRACT_REGEX = re.compile(
-    r".*?(\d+)?\s*\$\s*(\d+)?\s*(\\frac\{.*?\}\{.*?\}|\d+/\d+)\s*\$.*"
-)
+# One pattern per unit, applied in UNITS order. A single alternation is not
+# equivalent: removing one unit can join its neighbors into another unit
+# ("mmeterm" -> "mm" -> "" here, but "eterm" with one alternation pass).
+_UNIT_REGEXES = tuple(re.compile(rf"{unit}(es)?(s)? *(\^[0-9]+)?") for unit in UNITS)
+_LATEX_FRAC_EXTRACT_REGEX = re.compile(r".*?(\d+)?\s*\$\s*(\d+)?\s*(\\frac\{.*?\}\{.*?\}|\d+/\d+)\s*\$.*")
 _TEXT_BRACE_REGEX = re.compile(r"(\\text\{)(.*?)(\})")
 _TEXTBF_BRACE_REGEX = re.compile(r"(\\textbf\{)(.*?)(\})")
 _OVERLINE_BRACE_REGEX = re.compile(r"(\\overline\{)(.*?)(\})")
@@ -323,7 +326,8 @@ def normalize_final_answer(final_answer: str) -> str:
   # Apply substitutions and removals
   for before, after in SUBSTITUTIONS:
     final_answer = final_answer.replace(before, after)
-  final_answer = _UNITS_REGEX.sub("", final_answer)
+  for unit_regex in _UNIT_REGEXES:
+    final_answer = unit_regex.sub("", final_answer)
   for expr in REMOVED_EXPRESSIONS:
     final_answer = final_answer.replace(expr, "")
 
@@ -462,9 +466,7 @@ _LATEX_COMMANDS = (
     "choose",
     "binom",
 )
-_LATEX_COMMANDS_REGEX = re.compile(
-    r"(?<!\\)\b(?:" + "|".join(_LATEX_COMMANDS) + r")\b"
-)
+_LATEX_COMMANDS_REGEX = re.compile(r"(?<!\\)\b(?:" + "|".join(_LATEX_COMMANDS) + r")\b")
 
 
 def fix_latex_escaping(text: str) -> str:
@@ -485,6 +487,12 @@ _DEBUG_LOG_MKDIR_DONE: set[str] = set()
 
 
 def _write_debug_log_async(base_dir: str, run_name: str, log_content: str) -> None:
+  """Writes one `check_numbers` debug log file. Runs on a daemon thread.
+
+  The directory is usually on GCS, where mkdir and write are slow, so the
+  reward path does not wait for them. Nothing joins the thread, so failures are
+  logged instead of raised.
+  """
   try:
     debug_log_path = epath.Path(base_dir) / run_name / "debug_rl_logs"
     key = f"{base_dir}/{run_name}"
@@ -493,8 +501,8 @@ def _write_debug_log_async(base_dir: str, run_name: str, log_content: str) -> No
       _DEBUG_LOG_MKDIR_DONE.add(key)
     log_file = debug_log_path / f"check_numbers_{uuid.uuid4().hex}.txt"
     log_file.write_text(log_content)
-  except Exception:
-    pass
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    max_logging.log(f"check_numbers: failed to write the debug log: {e}")
 
 
 def check_numbers(
@@ -600,6 +608,8 @@ def _last_balanced_boxed(content: str) -> str | None:
   first_boxed = content.find(_BOXED_PREFIX)
   if first_boxed < 0:
     return None
+  # Braces before the first `\boxed` cannot open a box, and a "}" that finds
+  # the stack empty is ignored either way, so skipping them keeps the result.
   if first_boxed > 0:
     content = content[first_boxed:]
   best: str | None = None
