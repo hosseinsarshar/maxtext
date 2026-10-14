@@ -3601,7 +3601,9 @@ class AttentionTest(parameterized.TestCase):
     self.assertTrue(jnp.allclose(output, expected_output))
     self.assertEqual(output.shape, (self.global_batch_size, seq_len, self.embed_dim))
 
-  def _make_gqa_serving_attention(self, dtype=jnp.float32, attention="vllm_rpa", model_mode=MODEL_MODE_AUTOREGRESSIVE, **kwargs):
+  def _make_gqa_serving_attention(
+      self, dtype=jnp.float32, attention="vllm_rpa", model_mode=MODEL_MODE_AUTOREGRESSIVE, **kwargs
+  ):
     """Builds a small Qwen3-style GQA layer (4 query heads per KV head, q/k norms) and its inputs."""
     config = pyconfig.initialize(
         [sys.argv[0], get_test_config_path()],
@@ -3634,6 +3636,9 @@ class AttentionTest(parameterized.TestCase):
 
   def test_can_merge_vllm_qkv_needs_opt_in_and_plain_self_attention(self):
     layer, lnx, _ = self._make_gqa_serving_attention()
+    with mock.patch.dict(os.environ):
+      os.environ.pop("MAXTEXT_VLLM_MERGE_QKV", None)
+      self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
     with mock.patch.dict(os.environ, {"MAXTEXT_VLLM_MERGE_QKV": "0"}):
       self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
     with mock.patch.dict(os.environ, {"MAXTEXT_VLLM_MERGE_QKV": "1"}):
@@ -3651,6 +3656,25 @@ class AttentionTest(parameterized.TestCase):
       # q, k and v sharded differently, or more head shards than KV heads.
       for shards in (None, 4):
         with mock.patch.object(Attention, "_qkv_head_shards", return_value=shards):
+          self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+
+  def test_can_merge_vllm_qkv_skips_qwix_quantization_and_lora(self):
+    """Qwix quantization and LoRA hook each projection's dot_general, which the merged matmul would skip."""
+    layer, lnx, _ = self._make_gqa_serving_attention()
+    base_config = layer.config
+
+    class _ConfigWith:
+
+      def __init__(self, **overrides):
+        self._overrides = overrides
+
+      def __getattr__(self, name):
+        return self._overrides[name] if name in self._overrides else getattr(base_config, name)
+
+    with mock.patch.dict(os.environ, {"MAXTEXT_VLLM_MERGE_QKV": "1"}):
+      self.assertTrue(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
+      for overrides in ({"quantization": "int8"}, {"lora": types.SimpleNamespace(enable_lora=True)}):
+        with self.subTest(overrides=overrides), mock.patch.object(layer, "config", _ConfigWith(**overrides)):
           self.assertFalse(layer.can_merge_vllm_qkv(lnx, lnx, MODEL_MODE_AUTOREGRESSIVE, use_shared_kv=False))
 
   @parameterized.named_parameters(("one_head_shard", 1), ("two_head_shards", 2))
@@ -3678,7 +3702,9 @@ class AttentionTest(parameterized.TestCase):
 
     interface = types.ModuleType("tpu_inference.layers.common.attention_interface")
     interface.sharded_ragged_paged_attention = fake_rpa
-    fake_modules = {name: types.ModuleType(name) for name in ("tpu_inference", "tpu_inference.layers", "tpu_inference.layers.common")}
+    fake_modules = {
+        name: types.ModuleType(name) for name in ("tpu_inference", "tpu_inference.layers", "tpu_inference.layers.common")
+    }
     fake_modules[interface.__name__] = interface
 
     outputs = []

@@ -95,8 +95,19 @@ class L2Norm(nnx.Module):
 
 
 def _vllm_merge_qkv_requested() -> bool:
-  """Whether MAXTEXT_VLLM_MERGE_QKV asks vLLM serving to merge the q/k/v matmuls."""
-  return os.environ.get("MAXTEXT_VLLM_MERGE_QKV", "1").strip().lower() in ("1", "true", "yes", "on")
+  """Whether MAXTEXT_VLLM_MERGE_QKV asks vLLM serving to merge the q/k/v matmuls.
+
+  Off by default, because the merged matmul is not bit-exact with three
+  separate ones. Read at trace time.
+
+  Rule of thumb: turn it on when the model runs inside tpu-inference's fused
+  decode loop and each device decodes a small batch. There, the q/k/v matmuls
+  are small and dominated by fixed per-op cost, and the weight concat is hoisted
+  out of the loop. For Qwen3-0.6B GRPO rollouts on TPU v7x (tp=1), it saved
+  about 1.1 s of a 57 s RL step. In a plain per-step forward, the concat runs on
+  every call, so measure before turning it on there.
+  """
+  return os.environ.get("MAXTEXT_VLLM_MERGE_QKV", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _dense_kernel_in_compute_dtype(dense: DenseGeneral) -> Array:
@@ -827,12 +838,14 @@ class Attention(nnx.Module):
   def can_merge_vllm_qkv(self, inputs_q: Array, inputs_kv: Array, model_mode: str, use_shared_kv: bool) -> bool:
     """Whether vLLM serving can run the q, k and v projections as one matmul.
 
-    Opt-in through MAXTEXT_VLLM_MERGE_QKV=1. The merged matmul computes the same
-    dot products, but XLA may accumulate them in a different order, so results
-    can differ at the bf16 rounding level. Only plain self-attention
-    projections qualify: no quantization, fp8 weights, biases, shared or fused
-    projections, or explicit sharding; and q, k and v must shard the same way,
-    with the head shard count dividing num_kv_heads.
+    Opt-in through MAXTEXT_VLLM_MERGE_QKV=1 (off by default). The merged matmul
+    computes the same dot products, but XLA may accumulate them in a different
+    order, so results can differ at the bf16 rounding level. Only plain
+    self-attention projections qualify: no quantization (AQT, fp8 or Qwix), no
+    LoRA, biases, shared or fused projections, or explicit sharding; and q, k and
+    v must shard the same way, with the head shard count dividing num_kv_heads.
+    Qwix quantization and LoRA hook the dot_general inside each projection
+    module, which the merged matmul would bypass.
 
     Call this before resharding the inputs: it relies on the caller passing the
     same array for `inputs_q` and `inputs_kv`.
@@ -845,6 +858,8 @@ class Attention(nnx.Module):
       return False
     if (
         self.config.fused_qkv
+        or self.config.quantization
+        or getattr(getattr(self.config, "lora", None), "enable_lora", False)
         or self.share_kv_layer
         or self.share_kv_projections
         or self.is_qwen3_hybrid
@@ -889,7 +904,7 @@ class Attention(nnx.Module):
       specs.add(tuple(spec))
     if len(specs) != 1:
       return None
-    (spec,) = specs
+    spec = specs.pop()
     shards = 1
     for axis in spec[1]:
       shards *= self.mesh.shape.get(axis, 1)
@@ -902,8 +917,9 @@ class Attention(nnx.Module):
     2 * num_kv_heads) / P, head_dim): block p holds shard p's query heads, then
     its key heads, then its value heads. Heads are sharded in contiguous
     blocks, so each block comes from its own shard of q, k and v, and the
-    concat needs no communication. The weights do not change while decoding,
-    so XLA hoists the concat out of the decode loop.
+    concat needs no communication. Inside a fused decode loop the weights are
+    loop-invariant, so XLA hoists the concat out of the loop; a plain per-step
+    forward pays for the concat on every call.
 
     Why not group each KV head with its query heads, (embed, num_kv_heads,
     G + 2, head_dim)? On TPU7x that layout lowered to a slower 2D-window
